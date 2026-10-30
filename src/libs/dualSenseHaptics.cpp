@@ -694,14 +694,14 @@ void Close(bool speaker) {
 	g_buffer_frames[index] = 0;
 }
 
-bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
+WriteResult Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
            bool is_float, bool speaker, const float* gains) {
 	std::lock_guard lock(g_mutex);
 	if (data == nullptr || frames == 0 || source_channels == 0) {
-		return false;
+		return WriteResult::Refused;
 	}
 	if ((g_routes & (speaker ? ROUTE_SPEAKER : ROUTE_VIBRATION)) == 0U) {
-		return false;
+		return WriteResult::Refused;
 	}
 
 	// Bluetooth: the same mapping and gain, resampled to the 48 kHz its reports carry, then queued.
@@ -712,7 +712,7 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 		                                     ? frames
 		                                     : static_cast<uint32_t>(static_cast<uint64_t>(frames) * bt_rate / source_rate);
 		if (out_frames == 0) {
-			return false;
+			return WriteResult::Dropped;
 		}
 		std::vector<float> mixed(static_cast<size_t>(out_frames) * 2);
 		// Unity gain for the speaker, not the USB path's g_speaker_gain: the mainline's Bluetooth path
@@ -761,19 +761,19 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 		} else {
 			g_vibration_writes++;
 		}
-		return true;
+		return WriteResult::Played;
 	}
 
 	// The USB endpoint's own client, one per route, so neither silences the other's channels.
 	const int index = speaker ? 1 : 0;
 	if (g_client[index] == nullptr || g_mix[index] == nullptr) {
-		return false;
+		return WriteResult::Refused;
 	}
 
 	const auto target_rate     = g_mix[index]->nSamplesPerSec;
 	const auto target_channels = g_mix[index]->nChannels;
 	if (target_rate == 0 || target_channels < 2) {
-		return false;
+		return WriteResult::Refused;
 	}
 
 	const auto first_channel = speaker ? g_speaker_first_channel : g_first_channel;
@@ -787,23 +787,23 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 	                            : static_cast<uint32_t>(static_cast<uint64_t>(frames) * target_rate /
 	                                                    source_rate);
 	if (out_frames == 0) {
-		return false;
+		return WriteResult::Dropped;
 	}
 
 	UINT32 padding = 0;
 	if (FAILED(g_client[index]->GetCurrentPadding(&padding))) {
-		return false;
+		return WriteResult::Dropped;
 	}
 	const auto free =
 	    g_buffer_frames[index] > padding ? g_buffer_frames[index] - padding : 0;
 	if (free < out_frames) {
 		g_dropped_writes++;
-		return false; // behind: drop rather than delay the guest's audio thread
+		return WriteResult::Dropped; // behind: drop rather than delay the guest's audio thread
 	}
 
 	BYTE* buffer = nullptr;
 	if (FAILED(g_render[index]->GetBuffer(out_frames, &buffer)) || buffer == nullptr) {
-		return false;
+		return WriteResult::Dropped;
 	}
 
 	auto* out = reinterpret_cast<float*>(buffer);
@@ -913,7 +913,7 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 		            static_cast<unsigned long long>(route_clips),
 		            static_cast<unsigned long long>(g_dropped_writes), padding, g_buffer_frames[index]);
 	}
-	return true;
+	return WriteResult::Played;
 }
 
 } // namespace Libs::Controller::DualSenseHaptics
@@ -1178,12 +1178,12 @@ void Close(bool speaker) {
 	}
 }
 
-bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
+WriteResult Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
            bool is_float, bool speaker, const float* gains) {
 	std::lock_guard lock(g_mutex);
 	if (speaker || data == nullptr || frames == 0 || source_channels == 0 || source_rate == 0 ||
 	    (g_routes & ROUTE_VIBRATION) == 0U || g_device == 0) {
-		return false;
+		return WriteResult::Refused;
 	}
 	if (SDL_GetAudioDeviceStatus(g_device) == SDL_AUDIO_STOPPED) {
 		// The pad was unplugged (SDL stops its device; the queue would never drain): closed, and looked for again.
@@ -1195,7 +1195,7 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 		g_spec   = {};
 		g_device_name.clear();
 		g_routes &= ~ROUTE_VIBRATION;
-		return false;
+		return WriteResult::Refused;
 	}
 	const auto target_rate     = static_cast<uint32_t>(g_spec.freq);
 	const auto target_channels = static_cast<uint32_t>(g_spec.channels);
@@ -1204,14 +1204,14 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 	                                 ? frames
 	                                 : static_cast<uint32_t>(static_cast<uint64_t>(frames) * target_rate / source_rate);
 	if (out_frames == 0) {
-		return false;
+		return WriteResult::Dropped;
 	}
 	// Behind: drop rather than delay the guest's audio thread (and keep a hit from arriving late).
 	const auto frame_bytes = target_channels * sizeof(float);
 	const auto queued      = SDL_GetQueuedAudioSize(g_device);
 	if (queued / frame_bytes > static_cast<uint64_t>(target_rate) * MAX_QUEUE_MS / 1000u) {
 		g_dropped_writes++;
-		return false;
+		return WriteResult::Dropped;
 	}
 
 	auto& out = g_mix;
@@ -1257,7 +1257,7 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 	}
 	if (SDL_QueueAudio(g_device, out.data(), static_cast<Uint32>(out.size() * sizeof(float))) < 0) {
 		g_dropped_writes++;
-		return false;
+		return WriteResult::Dropped;
 	}
 	RumbleFromHaptics(peak, peak);
 
@@ -1272,7 +1272,7 @@ bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t sou
 		            static_cast<double>(g_vibration_peak_max), static_cast<unsigned long long>(g_vibration_clips),
 		            static_cast<unsigned long long>(g_dropped_writes), queued);
 	}
-	return true;
+	return WriteResult::Played;
 }
 
 } // namespace Libs::Controller::DualSenseHaptics
@@ -1286,7 +1286,7 @@ uint32_t SampleRate() { return 0; }
 uint32_t EndpointChannels() { return 0; }
 bool     Open(bool) { return false; }
 void     Close(bool) {}
-bool     Write(const void*, uint32_t, uint32_t, uint32_t, bool, bool, const float*) { return false; }
+WriteResult Write(const void*, uint32_t, uint32_t, uint32_t, bool, bool, const float*) { return WriteResult::Refused; }
 bool     SpeakerActive() { return false; }
 
 } // namespace Libs::Controller::DualSenseHaptics

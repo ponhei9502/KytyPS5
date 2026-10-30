@@ -670,20 +670,22 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 	// without it the actuators and the pad's speaker play far too quietly. Best effort: when the
 	// endpoint is behind, the audio is dropped rather than delaying the guest's audio thread.
 	if (port->audio_device == 0) {
-		if (port->type == AUDIO_OUT_PORT_TYPE_VIBRATION && Controller::DualSenseHaptics::Available()) {
-			report_pad_samples(false);
-			std::vector<uint8_t> prepared_buffer;
-			const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
-			if (Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq, PreparedChannels(*port),
-			                                        FormatIsFloat(port->format), false, gains))
-				return true;
-			// (The route is there but refused the write, a stereo-profile pad or a route not
-			// open yet: the pad's rumble motors below instead, as without the route.)
-		}
-		// No DualSense haptics endpoint: the pad's rumble motors instead (an Xbox controller, a Steam Deck's; issue #236).
 		if (port->type == AUDIO_OUT_PORT_TYPE_VIBRATION) {
 			std::vector<uint8_t> prepared_buffer;
 			const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
+			if (Controller::DualSenseHaptics::Available()) {
+				report_pad_samples(false);
+				const auto result = Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
+				                                                        PreparedChannels(*port), FormatIsFloat(port->format),
+				                                                        false, gains);
+				if (result == Controller::DualSenseHaptics::WriteResult::Played) return true;
+				// A block the route dropped (its queue behind, a transient endpoint failure) is not sent to the motors:
+				// its neighbours play on the actuators, and the pad would alternate between two drives.
+				if (result == Controller::DualSenseHaptics::WriteResult::Dropped) return false;
+				// Refused (a stereo-profile pad, a route not open yet, the pad unplugged): the rumble motors below,
+				// as without the route.
+			}
+			// No DualSense haptics endpoint: the pad's rumble motors instead (an Xbox controller, a Steam Deck's; issue #236).
 			Controller::RumbleFromVibrationAudio(prepared_data, port->samples_num, PreparedChannels(*port),
 			                                     FormatIsFloat(port->format), gains);
 		}
@@ -699,7 +701,8 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, const float* gains, b
 		const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer);
 		return Controller::DualSenseHaptics::Write(prepared_data, port->samples_num, port->freq,
 		                                           PreparedChannels(*port),
-		                                           FormatIsFloat(port->format), true, gains);
+		                                           FormatIsFloat(port->format), true, gains) ==
+		       Controller::DualSenseHaptics::WriteResult::Played;
 	}
 
 	std::vector<uint8_t> prepared_buffer;

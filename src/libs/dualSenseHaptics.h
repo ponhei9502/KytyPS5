@@ -84,8 +84,14 @@ bool SpeakerActive();
 // (its AudioOut2 gain attribute is where a pad's speaker and vibration levels live). Never waits:
 // when the endpoint's queue is behind, the audio is dropped (haptics are best effort, and the caller
 // is the guest's audio thread).
-bool Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
-           bool is_float, bool speaker, const float* gains);
+//   Played:  queued on the route.
+//   Dropped: the route is open but this block was not queued (the queue behind, a transient endpoint
+//            failure, nothing to play): the caller does nothing more with it, so the pad keeps one drive.
+//   Refused: no usable route (not open, the pad unplugged, a stereo profile, bad arguments): the caller
+//            may take another path (the vibration port: the rumble motors).
+enum class WriteResult { Played, Dropped, Refused };
+WriteResult Write(const void* data, uint32_t frames, uint32_t source_rate, uint32_t source_channels,
+                  bool is_float, bool speaker, const float* gains);
 
 } // namespace Libs::Controller::DualSenseHaptics
 
